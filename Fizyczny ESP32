@@ -1,0 +1,437 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// =====================================
+// NOKIA 5110 (CLK, DIN, DC, CE, RST)
+// =====================================
+
+Adafruit_PCD8544 display = Adafruit_PCD8544(18, 23, 2, 5, 4);
+
+// =====================================
+// WIFI
+// =====================================
+
+// const char* WIFI_SSID = "Wokwi-GUEST";
+// const char* WIFI_PASSWORD = "";
+
+const char* WIFI_SSID = "KCKU_LM";
+const char* WIFI_PASSWORD = "banan1999";
+
+// =====================================
+// MQTT
+// =====================================
+
+const char* MQTT_SERVER = "broker.hivemq.com";
+const int MQTT_PORT = 1883;
+const char* MQTT_TOPIC = "HomeAssistant_WSBMerito";
+
+// =====================================
+// PINY: LED I PRZYCISK
+// =====================================
+
+const int LED_PIN = 19;
+const int BUTTON_PIN = 25;
+
+// =====================================
+// CZAS (NTP) I POGODA (OPEN-METEO)
+// =====================================
+
+const char* NTP_SERVER = "pool.ntp.org";
+const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
+
+// Wspolrzedne (domyslnie Gdansk)
+const float LATITUDE = 54.3520;
+const float LONGITUDE = 18.6466;
+const unsigned long WEATHER_INTERVAL = 900000; // co 15 min
+
+String weatherSummary = "Brak";
+float outdoorTemp = 0.0;
+bool weatherKnown = false;
+unsigned long lastWeatherFetch = 0;
+bool weatherFetchPending = true;
+
+// =====================================
+// OBIEKTY I EKRANY
+// =====================================
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+int currentScreen = 0; // 0 = czujniki, 1 = czas i pogoda
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 200;
+
+// =====================================
+// DANE CZUJNIKOW
+// =====================================
+
+float temperature = 0;
+float humidity = 0;
+
+bool motion = false;
+int brightness = 0;
+
+bool temperatureKnown = false;
+bool humidityKnown = false;
+bool motionKnown = false;
+bool brightnessKnown = false;
+
+unsigned long lastMotionTime = 0;
+bool lightOn = false;
+
+const int DARK_THRESHOLD = 1000;
+const unsigned long MOTION_TIMEOUT = 10000;
+
+// =====================================
+// ODBIERANIE WIADOMOSCI MQTT
+// =====================================
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.println("Odebrano MQTT:");
+  Serial.println(message);
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    Serial.println("Blad JSON!");
+    return;
+  }
+
+  if (!doc["temperature"].isNull()) {
+    temperature = doc["temperature"];
+    temperatureKnown = true;
+  }
+
+  if (!doc["humidity"].isNull()) {
+    humidity = doc["humidity"];
+    humidityKnown = true;
+  }
+
+  if (!doc["motion"].isNull()) {
+    motion = doc["motion"];
+    motionKnown = true;
+
+    if (motion) {
+      lastMotionTime = millis();
+    }
+  }
+
+  if (!doc["brightness"].isNull()) {
+    brightness = doc["brightness"];
+    brightnessKnown = true;
+  }
+
+  Serial.println("Dane zaktualizowane.");
+}
+
+// =====================================
+// WIFI
+// =====================================
+
+void connectWiFi() {
+  Serial.println("Laczenie z WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi polaczone!");
+}
+
+// =====================================
+// MQTT
+// =====================================
+
+void reconnectMQTT() {
+  static unsigned long lastMqttAttempt = 0;
+
+  if (mqtt.connected()) {
+    return;
+  }
+
+  if (millis() - lastMqttAttempt < 2000 && lastMqttAttempt != 0) {
+    return;
+  }
+  lastMqttAttempt = millis();
+
+  String clientId = "SmartHome-Central-";
+  clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  Serial.println("Laczenie z MQTT...");
+
+  if (mqtt.connect(clientId.c_str())) {
+    Serial.println("MQTT polaczone!");
+    mqtt.subscribe(MQTT_TOPIC);
+    Serial.println("Nasluchiwanie MQTT aktywne.");
+  } else {
+    Serial.print("Blad MQTT: ");
+    Serial.println(mqtt.state());
+  }
+}
+
+// =====================================
+// CZAS NTP I POGODA Z SIECI
+// =====================================
+
+void initTime() {
+  configTzTime(TZ_INFO, NTP_SERVER);
+}
+
+String getFormattedTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 50)) {
+    return "--:--";
+  }
+  char buffer[9];
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+const char* mapWeatherCode(int code) {
+  if (code == 0) return "Slonce";
+  if (code == 1 || code == 2) return "Lekkie chmury";
+  if (code == 3) return "Pochmurno";
+  if (code == 45 || code == 48) return "Mgla";
+  if (code >= 51 && code <= 67) return "Deszcz";
+  if (code >= 71 && code <= 77) return "Snieg";
+  if (code >= 80 && code <= 82) return "Przelotny deszcz";
+  if (code >= 95) return "Burza";
+  return "Zmiennie";
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  HTTPClient http;
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=";
+  url += String(LATITUDE, 4);
+  url += "&longitude=";
+  url += String(LONGITUDE, 4);
+  url += "&current=temperature_2m,weather_code";
+
+  http.setTimeout(5000);
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, payload);
+
+      if (!err && !doc["current"].isNull()) {
+        outdoorTemp = doc["current"]["temperature_2m"] | 0.0;
+        int code = doc["current"]["weather_code"] | -1;
+        weatherSummary = mapWeatherCode(code);
+        weatherKnown = true;
+        Serial.print("Pogoda zaktualizowana: ");
+        Serial.print(weatherSummary);
+        Serial.print(" ");
+        Serial.println(outdoorTemp);
+      }
+    }
+  } else {
+    Serial.print("Blad HTTP pogody: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+}
+
+// =====================================
+// OBSLUGA PRZYCISKU
+// =====================================
+
+void handleButton() {
+  int reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    static int stableState = HIGH;
+    if (reading != stableState) {
+      stableState = reading;
+      if (stableState == LOW) {
+        currentScreen = (currentScreen == 0) ? 1 : 0;
+        displayData();
+      }
+    }
+  }
+
+  lastButtonState = reading;
+}
+
+// =====================================
+// EKRAN NOKIA 5110
+// =====================================
+
+void displayData() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+
+  if (currentScreen == 0) {
+    display.setCursor(0, 0);
+    display.println("SmartHome");
+    display.drawLine(0, 9, 83, 9, BLACK);
+
+    display.setCursor(0, 12);
+    display.print("Temp: ");
+    if (temperatureKnown) {
+      display.print(temperature, 1);
+      display.println("C");
+    } else {
+      display.println("Nieznana");
+    }
+
+    display.setCursor(0, 21);
+    display.print("Wilg: ");
+    if (humidityKnown) {
+      display.print(humidity, 0);
+      display.println("%");
+    } else {
+      display.println("Nieznana");
+    }
+
+    bool recentMotion = motionKnown && (millis() - lastMotionTime < MOTION_TIMEOUT);
+    bool seesLight = brightnessKnown && (brightness >= DARK_THRESHOLD);
+
+    display.setCursor(0, 30);
+    display.print("Ruch: ");
+    if (!motionKnown) {
+      display.println("?");
+    } else {
+      display.println(recentMotion ? "TAK" : "NIE");
+    }
+
+    display.setCursor(0, 39);
+    display.print("Swiatlo: ");
+    if (!brightnessKnown) {
+      display.println("?");
+    } else {
+      display.println(seesLight ? "TAK" : "NIE");
+    }
+  } else {
+    display.setCursor(0, 0);
+    display.println("Czas i Pogoda");
+    display.drawLine(0, 9, 83, 9, BLACK);
+
+    display.setCursor(0, 13);
+    display.print("Czas: ");
+    display.println(getFormattedTime());
+
+    display.setCursor(0, 24);
+    if (weatherKnown) {
+      display.println(weatherSummary);
+      display.setCursor(0, 35);
+      display.print("Zewn: ");
+      display.print(outdoorTemp, 1);
+      display.println("C");
+    } else {
+      display.println("Brak danych");
+    }
+  }
+
+  display.display();
+}
+
+// =====================================
+// AUTOMATYKA SWIATLA
+// =====================================
+
+void controlLight() {
+  bool shouldTurnOn = false;
+
+  if (motionKnown && brightnessKnown) {
+    bool isDark = brightness < DARK_THRESHOLD;
+    bool recentMotion = motionKnown && (millis() - lastMotionTime < MOTION_TIMEOUT);
+    shouldTurnOn = recentMotion && isDark;
+  }
+
+  lightOn = shouldTurnOn;
+  digitalWrite(LED_PIN, lightOn ? HIGH : LOW);
+}
+
+// =====================================
+// SETUP
+// =====================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  display.begin();
+  display.setContrast(55);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+  display.setCursor(0, 0);
+  display.println("SmartHome");
+  display.println("Uruchamianie...");
+  display.display();
+
+  connectWiFi();
+  initTime();
+
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+
+  delay(500);
+  displayData();
+}
+
+// =====================================
+// GLOWNA PETLA
+// =====================================
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    initTime();
+  }
+
+  if (!mqtt.connected()) {
+    reconnectMQTT();
+  }
+
+  mqtt.loop();
+  handleButton();
+  controlLight();
+
+  unsigned long now = millis();
+  if (weatherFetchPending || (now - lastWeatherFetch >= WEATHER_INTERVAL)) {
+    weatherFetchPending = false;
+    lastWeatherFetch = now;
+    fetchWeather();
+  }
+
+  static unsigned long lastDisplayUpdate = 0;
+  if (now - lastDisplayUpdate >= 1000) {
+    lastDisplayUpdate = now;
+    displayData();
+  }
+}
